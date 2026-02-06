@@ -389,7 +389,7 @@ def run_bigkeys_cli(
 
 
 def parse_bigkeys_output(output: str) -> BigKeysSummary:
-    """Parse the output of redis-cli --bigkeys."""
+    """Parse the output of redis-cli --bigkeys, --memkeys, or --keystats."""
     
     # Default values
     total_keys = 0
@@ -398,24 +398,32 @@ def parse_bigkeys_output(output: str) -> BigKeysSummary:
     type_stats = {}
     
     lines = output.split('\n')
-    in_summary = False
     
     for line in lines:
         line = line.strip()
         
-        # Parse "Sampled X keys in the keyspace!"
+        # Parse "Sampled X keys in the keyspace!" (bigkeys/memkeys format)
         match = re.search(r'Sampled (\d+) keys', line)
         if match:
             total_keys = int(match.group(1))
         
-        # Parse "Total key length in bytes is X (avg len Y)"
+        # Parse "Keys sampled: X" (keystats format)
+        match = re.search(r'Keys sampled:\s*(\d+)', line)
+        if match:
+            total_keys = int(match.group(1))
+        
+        # Parse "Total key length in bytes is X (avg len Y)" (bigkeys format)
         match = re.search(r'avg len ([\d.]+)', line)
         if match:
             avg_key_length = float(match.group(1))
         
-        # Parse "Biggest X found" lines in summary
+        # Parse "Total key length is X (YB avg)" (keystats format)
+        match = re.search(r'Total key length is .+ \((\d+)B avg\)', line)
+        if match:
+            avg_key_length = float(match.group(1))
+        
+        # Parse "Biggest X found" lines in summary (bigkeys format)
         # e.g., "Biggest string found "string:0" has 1000000 bytes"
-        # e.g., "Biggest list found "list:36" has 100 items"
         match = re.search(r'Biggest\s+(\w+)\s+found\s+"([^"]+)"\s+has\s+([\d]+)\s+(\w+)', line)
         if match:
             key_type = match.group(1)
@@ -428,9 +436,28 @@ def parse_bigkeys_output(output: str) -> BigKeysSummary:
                 'unit': unit
             }
         
-        # Parse type stats lines
+        # Parse "--- Top size per type ---" section (keystats format)
+        # e.g., "string     string:3 is 96.00M"
+        match = re.search(r'^(\w+)\s+(\S+)\s+is\s+([\d.]+)([BKMGTP]?)$', line)
+        if match and line and not line.startswith('#') and not line.startswith('-'):
+            key_type = match.group(1)
+            key_name = match.group(2)
+            size_str = match.group(3)
+            unit = match.group(4) or 'B'
+            
+            # Convert to bytes for consistency
+            multipliers = {'B': 1, 'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4, 'P': 1024**5}
+            size = int(float(size_str) * multipliers.get(unit, 1))
+            
+            if key_type not in biggest_by_type:
+                biggest_by_type[key_type] = {
+                    'key': key_name,
+                    'size': size,
+                    'unit': 'bytes'
+                }
+        
+        # Parse type stats lines (bigkeys/memkeys format)
         # e.g., "10096 strings with 12225904 bytes (96.59% of keys, avg size 1210.97)"
-        # e.g., "51 lists with 5002 items (00.49% of keys, avg size 98.08)"
         match = re.search(
             r'(\d+)\s+(\w+)\s+with\s+([\d]+)\s+(\w+)\s+\(([\d.]+)%\s+of keys,\s+avg size\s+([\d.]+)\)',
             line
@@ -449,6 +476,25 @@ def parse_bigkeys_output(output: str) -> BigKeysSummary:
                 'unit': unit,
                 'pct': pct,
                 'avg': avg_size
+            }
+        
+        # Parse keystats table format
+        # e.g., "string            4948  96.45%  198.61M   41.10K"
+        match = re.search(
+            r'^(\w+)\s+(\d+)\s+([\d.]+)%\s+([\d.]+[BKMGTP]?)\s+([\d.]+[BKMGTP]?)',
+            line
+        )
+        if match:
+            key_type = match.group(1)
+            count = int(match.group(2))
+            pct = float(match.group(3))
+            
+            type_stats[key_type] = {
+                'count': count,
+                'total': 0,  # keystats shows formatted, not raw
+                'unit': 'bytes',
+                'pct': pct,
+                'avg': 0
             }
     
     return BigKeysSummary(

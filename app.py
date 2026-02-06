@@ -1083,6 +1083,10 @@ def render_bigkeys_section(client):
             key="bigkeys_method",
             help="redis-cli is faster and scans all keys. Python scanner allows sampling."
         )
+    
+    # Define scan_type outside conditional so it's always available
+    scan_type = "bigkeys"  # Default
+    
     with col2:
         if scan_method == "redis-cli (recommended)":
             scan_type = st.selectbox(
@@ -1114,23 +1118,27 @@ def render_bigkeys_section(client):
             "keystats": "Combined analysis: memory size, element count, and distribution stats"
         }
         st.info(f"**--{scan_type}**: {scan_descriptions.get(scan_type, '')}")
+        
+        # Clear old results if scan type changed
+        if 'last_scan_type' in st.session_state and st.session_state.last_scan_type != scan_type:
+            if 'bigkeys_summary' in st.session_state:
+                st.session_state.bigkeys_summary = None
     
     if st.button("🔍 Scan Keys", type="primary", key="scan_bigkeys"):
         
         if scan_method == "redis-cli (recommended)":
-            scan_type_selected = scan_type if 'scan_type' in dir() else "bigkeys"
-            with st.spinner(f"Running redis-cli --{scan_type_selected} (scanning all keys)..."):
+            with st.spinner(f"Running redis-cli --{scan_type} (scanning all keys)..."):
                 success, result = run_redis_cli_scan(
                     host=profile.host,
                     port=profile.port,
                     password=profile.password if profile.password else None,
-                    scan_type=scan_type_selected
+                    scan_type=scan_type
                 )
                 
                 if success:
                     st.session_state.bigkeys_summary = result
                     st.session_state.bigkeys_report = None  # Clear old Python report
-                    st.session_state.last_scan_type = scan_type_selected
+                    st.session_state.last_scan_type = scan_type
                     st.success(f"Scan complete! Analyzed {result.total_keys:,} keys.")
                 else:
                     st.error(f"Error: {result}")
