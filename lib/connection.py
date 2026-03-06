@@ -122,12 +122,12 @@ class RedisConnectionManager:
             
             return True, f"Connected to {profile.host}:{profile.port}"
             
-        except redis.ConnectionError as e:
-            self.disconnect()
-            return False, "Connection failed: " + _connection_error_hint(profile.host, profile.port, e)
         except redis.AuthenticationError as e:
             self.disconnect()
             return False, f"Authentication failed: {str(e)}"
+        except redis.ConnectionError as e:
+            self.disconnect()
+            return False, "Connection failed: " + _connection_error_hint(profile.host, profile.port, e)
         except Exception as e:
             self.disconnect()
             hint = _connection_error_hint(profile.host, profile.port, e) if "connect" in str(e).lower() or "timeout" in str(e).lower() else str(e)
