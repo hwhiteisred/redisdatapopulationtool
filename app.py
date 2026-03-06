@@ -5,10 +5,19 @@ A Streamlit web application for populating Redis databases with various data typ
 
 import streamlit as st
 import time
+import logging
 from typing import Generator, Tuple
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+
+# Configure console logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # Import local modules
 from lib.config import ConfigManager, ConnectionProfile
@@ -71,6 +80,7 @@ def run_populator(
     Returns True if successful, False if an error occurred.
     """
     try:
+        logger.info("Populate: starting %s", operation_name)
         start_time = time.time()
         for current, total in populator_gen:
             progress = current / total if total > 0 else 1.0
@@ -78,9 +88,11 @@ def run_populator(
             status_text.text(f"{operation_name}: {current}/{total}")
         
         elapsed = time.time() - start_time
+        logger.info("Populate: %s complete in %.2fs", operation_name, elapsed)
         status_text.text(f"{operation_name}: Complete ({elapsed:.2f}s)")
         return True
     except Exception as e:
+        logger.exception("Populate: %s failed - %s", operation_name, e)
         status_text.text(f"{operation_name}: Error - {str(e)}")
         return False
 
@@ -130,6 +142,7 @@ def render_sidebar():
                 st.write(f"**Keys:** {server_info.get('total_keys', 0)}")
         
         if st.sidebar.button("Disconnect", type="secondary"):
+            logger.info("Disconnect: user disconnected from Redis")
             conn.disconnect()
             st.session_state.connected = False
             st.session_state.module_status = ModuleStatus()
@@ -140,13 +153,16 @@ def render_sidebar():
         if profile_id and st.sidebar.button("Connect", type="primary"):
             profile = config.get_profile(profile_id)
             if profile:
+                logger.info("Connect: attempting %s (%s:%s)", profile.name, profile.host, profile.port)
                 success, message = conn.connect(profile)
                 if success:
+                    logger.info("Connect: success - %s", message)
                     st.session_state.connected = True
                     st.session_state.module_status = conn.get_module_status()
                     st.sidebar.success(message)
                     st.rerun()
                 else:
+                    logger.warning("Connect: failed - %s", message)
                     st.sidebar.error(message)
     
     st.sidebar.divider()
@@ -173,25 +189,71 @@ def render_sidebar():
     
     # Profile management
     with st.sidebar.expander("➕ Add/Edit Profile"):
+        if "profile_connection_type" not in st.session_state:
+            st.session_state.profile_connection_type = "Docker (local)"
+        
+        connection_type = st.radio(
+            "Connection type",
+            ["Docker (local)", "External (database endpoint)"],
+            key="profile_connection_type",
+            help="Docker: local Redis/RE cluster. External: Redis Enterprise Cloud or any remote endpoint (host:port)."
+        )
+        
         with st.form("profile_form"):
             new_id = st.text_input("Profile ID", value="new-profile")
             new_name = st.text_input("Display Name", value="New Profile")
-            new_host = st.text_input("Host", value="localhost")
-            new_port = st.number_input("Port", value=6379, min_value=1, max_value=65535)
-            new_password = st.text_input("Password", type="password")
-            new_ssl = st.checkbox("Use SSL/TLS")
+            
+            if connection_type == "Docker (local)":
+                new_host = st.text_input("Host", value="localhost", key="profile_host_docker")
+                port_options = [6379, 12000, 12002, 12004]
+                port_index = st.selectbox(
+                    "Port",
+                    options=port_options,
+                    format_func=lambda x: str(x),
+                    index=0,
+                    key="profile_port_docker"
+                )
+                new_port = int(port_index)
+                new_ssl_default = False
+            else:
+                endpoint_input = st.text_input(
+                    "Endpoint (host:port)",
+                    value="",
+                    placeholder="hostname:port",
+                    key="profile_endpoint",
+                    help="Your database endpoint in host:port form."
+                )
+                if endpoint_input.strip():
+                    parts = endpoint_input.strip().rsplit(":", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        new_host = parts[0].strip()
+                        new_port = int(parts[1])
+                    else:
+                        new_host = endpoint_input.strip()
+                        new_port = 6379
+                else:
+                    new_host = ""
+                    new_port = 6379
+                new_ssl_default = True
+            
+            new_password = st.text_input("Password", type="password", key="profile_password")
+            new_ssl = st.checkbox("Use SSL/TLS", value=new_ssl_default, key="profile_ssl")
             
             if st.form_submit_button("Save Profile"):
-                profile = ConnectionProfile(
-                    name=new_name,
-                    host=new_host,
-                    port=int(new_port),
-                    password=new_password,
-                    ssl=new_ssl
-                )
-                config.add_profile(new_id, profile)
-                st.success(f"Profile '{new_name}' saved!")
-                st.rerun()
+                if connection_type == "External (database endpoint)" and not new_host:
+                    st.error("Enter a database endpoint (host:port).")
+                else:
+                    profile = ConnectionProfile(
+                        name=new_name,
+                        host=new_host or "localhost",
+                        port=new_port,
+                        password=new_password,
+                        ssl=new_ssl
+                    )
+                    config.add_profile(new_id, profile)
+                    logger.info("Profile saved: id=%s name=%s host=%s port=%s", new_id, new_name, new_host or "localhost", new_port)
+                    st.success(f"Profile '{new_name}' saved!")
+                    st.rerun()
     
     # Delete profile
     if profiles and len(profiles) > 1:
@@ -204,6 +266,7 @@ def render_sidebar():
             )
             if st.button("Delete", type="secondary"):
                 if config.delete_profile(delete_id):
+                    logger.info("Profile deleted: id=%s", delete_id)
                     st.success(f"Profile deleted!")
                     st.rerun()
 
@@ -701,13 +764,16 @@ def render_backups_tab():
                 if success:
                     st.session_state.re_api_credentials = credentials
                     st.session_state.re_api_client = api_client
+                    logger.info("Backup API: connected to %s:%s", api_host, api_port)
                     st.success(message)
                     st.rerun()
                 else:
+                    logger.warning("Backup API: connection failed - %s", message)
                     st.error(f"Connection failed: {message}")
         
         with col2:
             if st.session_state.re_api_client and st.button("🔌 Disconnect"):
+                logger.info("Backup API: disconnected")
                 st.session_state.re_api_client = None
                 st.session_state.re_api_credentials = None
                 st.rerun()
@@ -769,7 +835,7 @@ def render_databases_list(api: RedisEnterpriseAPI):
         })
     
     df = pd.DataFrame(data)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)
 
 
 def render_backup_config(api: RedisEnterpriseAPI):
@@ -890,6 +956,7 @@ def render_backup_restore(api: RedisEnterpriseAPI):
         
         if st.button("🚀 Start Backup Now", type="primary", key="trigger_backup"):
             with st.spinner("Initiating backup..."):
+                logger.info("Backup: triggering for db uid=%s to %s", selected_db.uid, export_location)
                 success, message = api.trigger_backup(selected_db.uid, export_location)
                 if success:
                     st.success(message)
@@ -906,13 +973,14 @@ def render_backup_restore(api: RedisEnterpriseAPI):
             "Import Source (full path to .rdb.gz file)",
             value="/var/opt/redislabs/backup/",
             key="import_location",
-            help="Full path to backup file including filename (e.g., /var/opt/redislabs/backup/bk20260205-111216-1-demodb-1_of_2-2-0-8191.rdb.gz)"
+            help="Full path to backup file including filename (e.g., /var/opt/redislabs/backup/backup.rdb.gz)"
         )
         
         st.caption("💡 Tip: Specify full path to .rdb.gz file, not just the directory")
         
         if st.button("📥 Import/Restore", key="import_db"):
             with st.spinner("Importing..."):
+                logger.info("Import: db uid=%s from %s", selected_db.uid, import_location)
                 success, message = api.import_database(selected_db.uid, import_location)
                 if success:
                     st.success(message)
@@ -994,7 +1062,7 @@ def render_overview_section(client):
             color='Category'
         )
         fig_memory.update_layout(showlegend=False)
-        st.plotly_chart(fig_memory, use_container_width=True)
+        st.plotly_chart(fig_memory, width='stretch')
     
     with col2:
         st.subheader("Keyspace Distribution")
@@ -1008,7 +1076,7 @@ def render_overview_section(client):
                 names=db_names,
                 title='Keys by Database'
             )
-            st.plotly_chart(fig_keyspace, use_container_width=True)
+            st.plotly_chart(fig_keyspace, width='stretch')
         else:
             st.info("No keyspace data available")
     
@@ -1039,7 +1107,7 @@ def render_overview_section(client):
             }
         ))
         fig_hits.update_layout(height=300)
-        st.plotly_chart(fig_hits, use_container_width=True)
+        st.plotly_chart(fig_hits, width='stretch')
     else:
         st.info("No hit/miss data available yet")
     
@@ -1127,6 +1195,7 @@ def render_bigkeys_section(client):
     if st.button("🔍 Scan Keys", type="primary", key="scan_bigkeys"):
         
         if scan_method == "redis-cli (recommended)":
+            logger.info("BigKeys: starting redis-cli --%s on %s:%s", scan_type, profile.host, profile.port)
             with st.spinner(f"Running redis-cli --{scan_type} (scanning all keys)..."):
                 success, result = run_redis_cli_scan(
                     host=profile.host,
@@ -1136,11 +1205,13 @@ def render_bigkeys_section(client):
                 )
                 
                 if success:
+                    logger.info("BigKeys: scan complete, %s keys", result.total_keys if hasattr(result, 'total_keys') else '?')
                     st.session_state.bigkeys_summary = result
                     st.session_state.bigkeys_report = None  # Clear old Python report
                     st.session_state.last_scan_type = scan_type
                     st.success(f"Scan complete! Analyzed {result.total_keys:,} keys.")
                 else:
+                    logger.warning("BigKeys: scan failed - %s", result)
                     st.error(f"Error: {result}")
         else:
             # Python scanner
@@ -1202,7 +1273,7 @@ def render_bigkeys_section(client):
                     df_types, values='Count', names='Type',
                     title='Keys by Type'
                 )
-                st.plotly_chart(fig_types, use_container_width=True)
+                st.plotly_chart(fig_types, width='stretch')
         
         with col2:
             st.subheader("Data by Type")
@@ -1216,7 +1287,7 @@ def render_bigkeys_section(client):
                     title='Total Size/Items by Type',
                     hover_data=['Unit', 'Avg']
                 )
-                st.plotly_chart(fig_stats, use_container_width=True)
+                st.plotly_chart(fig_stats, width='stretch')
         
         # Biggest keys by type
         st.subheader("🏆 Biggest Key per Type")
@@ -1228,7 +1299,7 @@ def render_bigkeys_section(client):
                     'Key': info['key'],
                     'Size': f"{info['size']:,} {info['unit']}"
                 })
-            st.dataframe(pd.DataFrame(biggest_data), use_container_width=True)
+            st.dataframe(pd.DataFrame(biggest_data), width='stretch')
         
         # Type statistics table
         st.subheader("📊 Type Statistics")
@@ -1242,7 +1313,7 @@ def render_bigkeys_section(client):
                     '% of Keys': f"{stats['pct']:.2f}%",
                     'Avg Size': f"{stats['avg']:.2f}"
                 })
-            st.dataframe(pd.DataFrame(stats_data), use_container_width=True)
+            st.dataframe(pd.DataFrame(stats_data), width='stretch')
         
         # Raw output expander
         with st.expander("📋 Raw redis-cli Output"):
@@ -1267,7 +1338,7 @@ def render_bigkeys_section(client):
                     df_types, values='Count', names='Type',
                     title='Keys by Type'
                 )
-                st.plotly_chart(fig_types, use_container_width=True)
+                st.plotly_chart(fig_types, width='stretch')
         
         with col2:
             st.subheader("Memory by Type")
@@ -1281,7 +1352,7 @@ def render_bigkeys_section(client):
                     title='Memory Usage by Type',
                     hover_data=['Memory_Readable']
                 )
-                st.plotly_chart(fig_memory, use_container_width=True)
+                st.plotly_chart(fig_memory, width='stretch')
         
         st.subheader("Largest Key per Type")
         if report.largest_by_type:
@@ -1295,7 +1366,7 @@ def render_bigkeys_section(client):
                     'Encoding': key_info.encoding,
                     'TTL': key_info.ttl if key_info.ttl >= 0 else 'No expiry'
                 })
-            st.dataframe(pd.DataFrame(largest_data), use_container_width=True)
+            st.dataframe(pd.DataFrame(largest_data), width='stretch')
         
         st.subheader(f"Top {len(report.top_keys_by_memory)} Keys by Memory")
         if report.top_keys_by_memory:
@@ -1318,9 +1389,9 @@ def render_bigkeys_section(client):
                 hover_data=['Type', 'Size', 'Elements']
             )
             fig_top.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_top, use_container_width=True)
+            st.plotly_chart(fig_top, width='stretch')
             
-            st.dataframe(df_top[['Key', 'Type', 'Size', 'Elements', 'Encoding']], use_container_width=True)
+            st.dataframe(df_top[['Key', 'Type', 'Size', 'Elements', 'Encoding']], width='stretch')
 
 
 def render_slowlog_section(client):
@@ -1337,36 +1408,42 @@ def render_slowlog_section(client):
     
     slowlog = get_slowlog(client, count)
     
-    if slowlog and 'error' not in slowlog[0]:
-        if len(slowlog) == 0:
-            st.info("No slow log entries found. This is good!")
-        else:
-            # Summary metrics
-            col1, col2, col3 = st.columns(3)
-            durations = [e['duration_ms'] for e in slowlog]
-            with col1:
-                st.metric("Total Entries", len(slowlog))
-            with col2:
-                st.metric("Max Duration", f"{max(durations):.2f} ms")
-            with col3:
-                st.metric("Avg Duration", f"{sum(durations)/len(durations):.2f} ms")
-            
-            # Duration chart
-            df_slow = pd.DataFrame(slowlog)
-            fig_slow = px.bar(
-                df_slow, x='id', y='duration_ms',
-                title='Slow Commands by Duration',
-                hover_data=['command']
-            )
-            st.plotly_chart(fig_slow, use_container_width=True)
-            
-            # Table
-            st.dataframe(
-                df_slow[['id', 'duration_ms', 'command', 'client_address']],
-                use_container_width=True
-            )
+    if slowlog is None:
+        logger.warning("Slow log: could not retrieve (None)")
+        st.error("Error getting slow log: Could not retrieve slow log")
+    elif len(slowlog) == 0:
+        logger.info("Slow log: no entries")
+        st.info("No slow log entries found. This is good!")
+    elif len(slowlog) > 0 and isinstance(slowlog[0], dict) and 'error' in slowlog[0]:
+        err_msg = slowlog[0].get('error', 'Unknown error')
+        logger.warning("Slow log error: %s", err_msg)
+        st.error(f"Error getting slow log: {err_msg}")
     else:
-        st.error(f"Error getting slow log: {slowlog[0].get('error', 'Unknown error')}")
+        logger.info("Slow log: %d entries", len(slowlog))
+        # Summary metrics
+        col1, col2, col3 = st.columns(3)
+        durations = [e['duration_ms'] for e in slowlog]
+        with col1:
+            st.metric("Total Entries", len(slowlog))
+        with col2:
+            st.metric("Max Duration", f"{max(durations):.2f} ms")
+        with col3:
+            st.metric("Avg Duration", f"{sum(durations)/len(durations):.2f} ms")
+        
+        # Duration chart
+        df_slow = pd.DataFrame(slowlog)
+        fig_slow = px.bar(
+            df_slow, x='id', y='duration_ms',
+            title='Slow Commands by Duration',
+            hover_data=['command']
+        )
+        st.plotly_chart(fig_slow, width='stretch')
+        
+        # Table
+        st.dataframe(
+            df_slow[['id', 'duration_ms', 'command', 'client_address']],
+            width='stretch'
+        )
 
 
 def render_clients_section(client):
@@ -1397,13 +1474,14 @@ def render_clients_section(client):
                 title='Client Connection Age (seconds)',
                 nbins=20
             )
-            st.plotly_chart(fig_age, use_container_width=True)
+            st.plotly_chart(fig_age, width='stretch')
         
         # Full client list
         st.subheader("Client Details")
-        st.dataframe(df_clients, use_container_width=True)
+        st.dataframe(df_clients, width='stretch')
     else:
-        st.error(f"Error getting client list: {clients[0].get('error', 'Unknown error')}")
+        err = clients[0].get('error', 'Unknown error') if clients else 'Could not retrieve client list'
+        st.error(f"Error getting client list: {err}")
 
 
 def render_commands_section(client):
@@ -1447,7 +1525,7 @@ def render_commands_section(client):
             title='Most Called Commands'
         )
         fig_calls.update_xaxes(tickangle=45)
-        st.plotly_chart(fig_calls, use_container_width=True)
+        st.plotly_chart(fig_calls, width='stretch')
     
     with col2:
         st.subheader("Top Commands by Time")
@@ -1457,7 +1535,7 @@ def render_commands_section(client):
             title='Most Time-Consuming Commands'
         )
         fig_time.update_xaxes(tickangle=45)
-        st.plotly_chart(fig_time, use_container_width=True)
+        st.plotly_chart(fig_time, width='stretch')
     
     # Slowest commands by average
     st.subheader("Slowest Commands (by average)")
@@ -1467,11 +1545,11 @@ def render_commands_section(client):
         title='Slowest Commands (min 10 calls)'
     )
     fig_avg.update_xaxes(tickangle=45)
-    st.plotly_chart(fig_avg, use_container_width=True)
+    st.plotly_chart(fig_avg, width='stretch')
     
     # Full table
     with st.expander("📋 All Command Statistics"):
-        st.dataframe(df_cmds, use_container_width=True)
+        st.dataframe(df_cmds, width='stretch')
 
 
 def render_utilities():
@@ -1490,6 +1568,7 @@ def render_utilities():
             
             if st.button("🗑️ Flush Current Database", type="secondary"):
                 if st.session_state.get('confirm_flush'):
+                    logger.warning("Flush DB: executing flushdb")
                     success, message = conn.flush_db()
                     if success:
                         st.success(message)
@@ -1510,6 +1589,7 @@ def render_utilities():
 
 def main():
     """Main application entry point."""
+    logger.info("App starting")
     init_session_state()
     
     # Render sidebar

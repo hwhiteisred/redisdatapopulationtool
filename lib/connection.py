@@ -6,8 +6,49 @@ import redis
 from redis import ConnectionPool
 from typing import Dict, Optional, Any, Tuple
 from dataclasses import dataclass
+import ipaddress
 
 from .config import ConnectionProfile
+
+
+def _is_private_ip(host: str) -> bool:
+    """Return True if host is a private IP (10.x, 172.16-31.x, 192.168.x) or localhost."""
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private
+    except ValueError:
+        return False  # hostname, not an IP
+
+
+def _connection_error_hint(host: str, port: int, exc: Exception) -> str:
+    """Build a user-friendly error message with hints for common failure reasons."""
+    base = str(exc).strip() or "Connection failed"
+    if not base.endswith("."):
+        base += "."
+    hints = []
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private and host not in ("localhost", "127.0.0.1"):
+            hints.append(
+                f" {host} is a private/VPC address — ensure this machine can reach it "
+                "(same network, VPN, or SSH tunnel to the instance)."
+            )
+    except ValueError:
+        pass
+    if "timed out" in base.lower() or "timeout" in base.lower():
+        hints.append(" Try a longer timeout or check firewall/security groups allow port {}.".format(port))
+    if "refused" in base.lower() or "rejected" in base.lower() or "connection refused" in base.lower():
+        hints.append(
+            " The server is rejecting the connection. On the Redis host, check: (1) Redis is bound to 0.0.0.0 "
+            "(or to this IP), not only 127.0.0.1 — e.g. in redis.conf set bind 0.0.0.0 and restart Redis; "
+            "(2) protected-mode allows your client (set a password with requirepass, or ensure the client IP is trusted); "
+            "(3) a local firewall allows inbound port {}.".format(port)
+        )
+    if hints:
+        base += "".join(hints)
+    return base
 
 
 @dataclass
@@ -50,13 +91,14 @@ class RedisConnectionManager:
             # Close existing connection if any
             self.disconnect()
             
-            # Build connection pool arguments
+            # Use longer timeouts for remote hosts (private IPs / VPC often need more time)
+            connect_timeout = 25 if _is_private_ip(profile.host) or profile.host not in ("localhost", "127.0.0.1") else 10
             pool_kwargs = {
                 'host': profile.host,
                 'port': profile.port,
                 'decode_responses': True,
-                'socket_timeout': 10,
-                'socket_connect_timeout': 10,
+                'socket_timeout': max(connect_timeout, 15),
+                'socket_connect_timeout': connect_timeout,
             }
             
             if profile.password:
@@ -82,13 +124,14 @@ class RedisConnectionManager:
             
         except redis.ConnectionError as e:
             self.disconnect()
-            return False, f"Connection failed: {str(e)}"
+            return False, "Connection failed: " + _connection_error_hint(profile.host, profile.port, e)
         except redis.AuthenticationError as e:
             self.disconnect()
             return False, f"Authentication failed: {str(e)}"
         except Exception as e:
             self.disconnect()
-            return False, f"Error: {str(e)}"
+            hint = _connection_error_hint(profile.host, profile.port, e) if "connect" in str(e).lower() or "timeout" in str(e).lower() else str(e)
+            return False, f"Error: {hint}"
     
     def disconnect(self) -> None:
         """Close the current connection."""
